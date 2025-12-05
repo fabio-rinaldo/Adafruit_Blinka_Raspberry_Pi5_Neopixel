@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <iostream>
 #include <time.h>
 #include <pybind11/pybind11.h>
@@ -11,14 +12,97 @@
 namespace py = pybind11;
 
 static PIO pio{};
-static int sm{-1};
 static int offset{-1};
-static int last_gpio{-1};
-static size_t last_size{};
 static struct timespec deadline;
 
 constexpr auto NS_PER_SECOND = 1'000'000'000l;
 constexpr auto NS_PER_MS = 1'000'000l;
+
+
+//Data related to a state machine
+struct SmData {
+    int smId = -1; //state machine ID
+    size_t lastSize = 0; // size of last data transferred to the state machine
+
+    SmData() = default;
+    SmData(int p_smid, size_t p_lastSize) : smId(p_smid), lastSize(p_lastSize) {}
+};
+
+
+//class to manage allocations of pio state machines to a gpio pin
+class SmMgr {
+
+    inline const static int MAX_SM_ALLOC = 4; // max amount state machine allocations allowed
+    inline const static int SM_NA = -1; // returned by functions if state machine is not valid / not found
+
+    private:
+        std::unordered_map<int, SmData> smMap; // map of gpio::state machine allocations
+
+    public:
+        // Constructor
+        SmMgr(){
+            smMap.reserve(MAX_SM_ALLOC);
+        }
+
+        // Allocates a state machine to a gpio pin, if available
+        // Returns associated state machine if already allocated
+        int allocateSm(int gpio) {
+            int tmpSm = getSm(gpio);
+            if(tmpSm >= 0)
+                return tmpSm;
+            if (smMap.size() >= MAX_SM_ALLOC) {
+                return SM_NA;
+            }
+            tmpSm = pio_claim_unused_sm(pio, true);
+            smMap.try_emplace(gpio, tmpSm, 0);
+            return tmpSm;
+        }
+
+        // Get state machine associated to a gpio pin, if available
+        // Return -1 if not
+        int getSm(int gpio) const {
+            auto it = smMap.find(gpio);
+            if(it != smMap.end()) {
+                return it->second.smId;
+            }
+            return SM_NA;
+        }
+
+        // set size of last data transferred to sm associated with [gpio] if allocated
+        // return 1 if successful, 0 if not found
+        int setLastSize(int gpio, int value) {
+            if(smMap.find(gpio) != smMap.end()) {
+                smMap[gpio].lastSize = value;
+                return 1;
+            }
+            else {
+                return 0;
+            }
+        }
+
+        // Get size of last data transferred to SM, if available
+        // Return -1 if not available
+        size_t getLastSize(int gpio) const {
+            if(smMap.find(gpio) != smMap.end()) {
+                return smMap.at(gpio).lastSize;
+            }
+            else {
+                return SM_NA;
+            }
+        }
+
+        // Free all state machines 
+        void freeAllSm() {
+            for(const auto& pair : smMap) {
+                pio_sm_unclaim(pio, pair.second.smId);
+            }
+            smMap.clear();
+        }
+};
+
+//instance state machine manager
+static SmMgr smManager;
+
 
 static void timespec_add_ns(struct timespec &out, const struct timespec &in, long ns) {
     out = in;
@@ -29,39 +113,37 @@ static void timespec_add_ns(struct timespec &out, const struct timespec &in, lon
     }
 }
 
+
 static void neopixel_write(py::object gpio_obj, py::buffer buf) {
     int gpio = py::getattr(gpio_obj, "_pin", gpio_obj).attr("id").cast<int>();
     py::buffer_info info = buf.request();
-
+    int sm = smManager.getSm(gpio);
     if (!pio || sm < 0) {
-        // (is safe to call twice)
-        if (pio_init()) {
-            throw std::runtime_error("pio_init() failed");
+        if(!pio) {
+            // (is safe to call twice)
+            if (pio_init()) {
+                throw std::runtime_error("pio_init() failed");
+            }
+    
+            // can't use `pio0` macro as it will call exit() on failure!
+            pio = pio_open(0);
+            if (PIO_IS_ERR(pio)) {
+                throw std::runtime_error(
+                    py::str("Failed to open PIO device (error {})")
+                        .attr("format")(PIO_ERR_VAL(pio))
+                        .cast<std::string>());
+            }
+
+            offset = pio_add_program(pio, &ws2812_program);
         }
-
-        // can't use `pio0` macro as it will call exit() on failure!
-        pio = pio_open(0);
-        if (PIO_IS_ERR(pio)) {
-            throw std::runtime_error(
-                py::str("Failed to open PIO device (error {})")
-                    .attr("format")(PIO_ERR_VAL(pio))
-                    .cast<std::string>());
-        }
-
-        sm = pio_claim_unused_sm(pio, true);
-
-        offset = pio_add_program(pio, &ws2812_program);
-
-        pio_sm_clear_fifos(pio, sm);
-        ws2812_program_init(pio, sm, offset, gpio, 800000.0, true);
-    } else {
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
-        if (gpio != last_gpio) {
+        if(sm<0) {
+            sm = smManager.allocateSm(gpio);
+            pio_sm_clear_fifos(pio, sm);
             ws2812_program_init(pio, sm, offset, gpio, 800000.0, true);
         }
+    } else {
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
     }
-    last_gpio = gpio;
-
 
     size_t size = info.size * info.itemsize;
 
@@ -79,12 +161,11 @@ static void neopixel_write(py::object gpio_obj, py::buffer buf) {
     if (data_size > UINT16_MAX) {
         throw py::value_error("Too much data");
     }
-
-    if (data_size != last_size) {
+    if (data_size != smManager.getLastSize(gpio)) {
         if (pio_sm_config_xfer(pio, sm, PIO_DIR_TO_SM, data_size, 1)) {
             throw std::runtime_error("pio_sm_config_xfer() failed");
         }
-        last_size = data_size;
+        smManager.setLastSize(gpio, data_size);
     }
     if (pio_sm_xfer_data(pio, sm, PIO_DIR_TO_SM, data_size, &vec[0])) {
         throw std::runtime_error("pio_sm_xfer_data() failed");
@@ -108,10 +189,9 @@ static void free_pio(void) {
         pio_remove_program(pio, &ws2812_program, offset);
     };
     offset = -1;
-    if (sm >= 0) {
-        pio_sm_unclaim(pio, sm);
-    }
-    sm = -1;
+
+    smManager.freeAllSm();
+
     pio_close(pio);
     pio = nullptr;
 }
